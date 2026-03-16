@@ -1,189 +1,204 @@
+import yfinance as yf
+import pandas as pd
 import time
 import datetime
 import requests
-import pandas as pd
-import yfinance as yf
-import config
 
-# ===============================
-# TELEGRAM
-# ===============================
-def send_telegram(msg):
-    url = f"https://api.telegram.org/bot{config.TELEGRAM_BOT_TOKEN}/sendMessage"
-    data = {"chat_id": config.TELEGRAM_CHAT_ID, "text": msg}
-    try:
-        requests.post(url, data=data, timeout=10)
-    except:
-        pass
+# ========= TELEGRAM =========
+BOT_TOKEN = "7836481326:AAEdb4avdV9SP3Ki4kl0gGcVk3KL9RESObo"
+CHAT_ID = "7608325440"
 
-# ===============================
-# TIME HELPERS
-# ===============================
-def str_to_time(t):
-    return datetime.datetime.strptime(t, "%H:%M").time()
+# ========= SETTINGS =========
+MAX_TRADES = 10
+STOP_LOSS_PCT = 0.05
+TARGET_PCT = 0.10
+VOLUME_MULTIPLIER = 1.5
 
-TRADE_START = str_to_time(config.TRADE_START)
-FORCE_EXIT = str_to_time(config.FORCE_EXIT)
-MARKET_END = str_to_time(config.MARKET_END)
-
-# ===============================
-# STATE
-# ===============================
 trade_count = 0
-open_trade = None
 trades = []
+active_trade = None
 
-# ===============================
-# DATA FETCH (SAFE)
-# ===============================
-def fetch_nifty_data():
+# ========= TELEGRAM FUNCTION =========
+
+def send_telegram(msg):
     try:
-        df = yf.download(
-            "^NSEI",
-            interval=f"{config.TIMEFRAME_MIN}m",
-            period="1d",
-            progress=False
-        )
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+        data = {"chat_id": CHAT_ID, "text": msg}
+        requests.post(url, data=data)
+    except:
+        print("Telegram error")
+
+
+# ========= DATA DOWNLOAD =========
+
+def get_data():
+
+    try:
+        df = yf.download("^NSEI", period="1d", interval="5m")
+
         if df is None or df.empty:
+            print("⚠ Data not received")
+            time.sleep(30)
             return None
 
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-
-        df.dropna(inplace=True)
         return df
 
-    except Exception:
+    except Exception as e:
+        print("DATA ERROR:", e)
+        time.sleep(30)
         return None
 
-# ===============================
-# INDICATORS
-# ===============================
-def apply_indicators(df):
-    df["EMA_FAST"] = df["Close"].ewm(span=config.EMA_FAST, adjust=False).mean()
-    df["EMA_SLOW"] = df["Close"].ewm(span=config.EMA_SLOW, adjust=False).mean()
-    df["AVG_VOL"] = df["Volume"].rolling(20).mean()
+
+# ========= INDICATORS =========
+
+def add_indicators(df):
+
+    df["EMA9"] = df["Close"].ewm(span=9).mean()
+    df["EMA21"] = df["Close"].ewm(span=21).mean()
+    df["AVG_VOL"] = df["Volume"].rolling(10).mean()
+
     return df
 
-# ===============================
-# POSITION SIZE
-# ===============================
-def calculate_qty(premium):
-    risk_amt = config.TOTAL_CAPITAL * config.RISK_PER_TRADE
-    sl_amt = premium * config.STOP_LOSS_PCT * config.LOT_SIZE
-    lots = int(risk_amt / sl_amt)
-    return max(lots, 1) * config.LOT_SIZE
 
-# ===============================
-# ENTRY LOGIC (GUARDED)
-# ===============================
-def check_entry(df):
-    global trade_count, open_trade
+# ========= ATM OPTION =========
 
-    if open_trade or trade_count >= config.MAX_TRADES_PER_DAY:
-        return
+def get_atm(price):
 
-    if df is None or len(df) < 25:
-        return  # not enough data
+    strike = round(price / 50) * 50
+
+    call = f"NIFTY {strike} CE"
+    put = f"NIFTY {strike} PE"
+
+    return call, put
+
+
+# ========= SIGNAL =========
+
+def check_signal(df):
 
     last = df.iloc[-1]
-    prev = df.iloc[-2]
 
-    ema_fast = float(last["EMA_FAST"])
-    ema_slow = float(last["EMA_SLOW"])
-    close_price = float(last["Close"])
-    volume = float(last["Volume"])
-
-    if pd.isna(last["AVG_VOL"]):
-        return
-
+    price = float(last["Close"])
+    ema9 = float(last["EMA9"])
+    ema21 = float(last["EMA21"])
+    vol = float(last["Volume"])
     avg_vol = float(last["AVG_VOL"])
 
-    uptrend = ema_fast > ema_slow
-    downtrend = ema_fast < ema_slow
+    if avg_vol == 0:
+        return None, price
 
-    breakout = close_price > float(prev["High"])
-    breakdown = close_price < float(prev["Low"])
+    volume_ok = vol > avg_vol * VOLUME_MULTIPLIER
 
-    volume_ok = volume > avg_vol * config.VOLUME_MULTIPLIER
+    if ema9 > ema21 and volume_ok:
+        return "CALL", price
 
-    if uptrend and breakout and volume_ok:
-        direction = "CALL"
-    elif downtrend and breakdown and volume_ok:
-        direction = "PUT"
-    else:
-        return
+    if ema9 < ema21 and volume_ok:
+        return "PUT", price
 
-    premium = round(close_price * 0.012, 2)
-    qty = calculate_qty(premium)
-    sl = round(premium * (1 - config.STOP_LOSS_PCT), 2)
-    target = round(premium * (1 + config.TARGET_PCT), 2)
+    return None, price
 
-    open_trade = {
-        "direction": direction,
-        "entry": premium,
-        "sl": sl,
-        "target": target,
-        "qty": qty,
-        "entry_time": datetime.datetime.now()
-    }
 
-    trade_count += 1
+# ========= BOT START =========
 
-    send_telegram(
-        f"📥 ENTRY {direction}\n"
-        f"Trade {trade_count}/{config.MAX_TRADES_PER_DAY}\n"
-        f"NIFTY Spot: {round(close_price,2)}\n"
-        f"Premium: {premium}\n"
-        f"Qty: {qty}\n"
-        f"SL: {sl}\n"
-        f"Target: {target}\n"
-        f"Logic: EMA + Volume + Breakout\n"
-        f"Mode: PAPER"
-    )
+send_telegram("🚀 NIFTY AUTO BOT V3 STARTED")
 
-# ===============================
-# EXIT LOGIC
-# ===============================
-def check_exit(df):
-    global open_trade
+print("BOT STARTED")
 
-    if open_trade is None or df is None:
-        return
-
-    last_price = round(float(df.iloc[-1]["Close"]) * 0.012, 2)
-
-    if last_price <= open_trade["sl"] or last_price >= open_trade["target"]:
-        pnl = round((last_price - open_trade["entry"]) * open_trade["qty"], 2)
-
-        trades.append(pnl)
-
-        send_telegram(
-            f"📤 EXIT {open_trade['direction']}\n"
-            f"Exit Premium: {last_price}\n"
-            f"P/L: {pnl}"
-        )
-
-        open_trade = None
-
-# ===============================
-# MAIN LOOP
-# ===============================
-send_telegram("🤖 NIFTY AUTO BOT STARTED (SAFE MODE)")
+# ========= MAIN LOOP =========
 
 while True:
+
     now = datetime.datetime.now().time()
 
-    df = fetch_nifty_data()
-    if df is not None:
-        df = apply_indicators(df)
+    if now < datetime.time(9,15):
+        time.sleep(60)
+        continue
 
-    if TRADE_START <= now <= FORCE_EXIT:
-        check_exit(df)
-        check_entry(df)
+    if now > datetime.time(15,30):
 
-    if now >= MARKET_END:
-        send_telegram("🛑 MARKET CLOSED")
+        report = f"📊 DAY END REPORT\n\nTrades: {len(trades)}\n"
+
+        for t in trades:
+            report += f"{t}\n"
+
+        send_telegram(report)
+
+        print("Market closed")
         break
+
+    df = get_data()
+
+    if df is None:
+        continue
+
+    df = add_indicators(df)
+
+    signal, price = check_signal(df)
+
+    # ===== ENTRY =====
+
+    if signal and trade_count < MAX_TRADES and active_trade is None:
+
+        trade_count += 1
+
+        call, put = get_atm(price)
+        option = call if signal == "CALL" else put
+
+        sl = price * (1 - STOP_LOSS_PCT)
+        target = price * (1 + TARGET_PCT)
+
+        active_trade = {
+            "type": signal,
+            "entry": price,
+            "sl": sl,
+            "target": target,
+            "option": option
+        }
+
+        msg = f"""
+📢 ENTRY {signal}
+
+Option: {option}
+Price: {price:.2f}
+SL: {sl:.2f}
+Target: {target:.2f}
+
+Trade No: {trade_count}
+"""
+
+        send_telegram(msg)
+        print(msg)
+
+
+    # ===== EXIT =====
+
+    if active_trade:
+
+        entry = active_trade["entry"]
+        sl = active_trade["sl"]
+        target = active_trade["target"]
+
+        if price <= sl or price >= target:
+
+            pnl = price - entry
+
+            if active_trade["type"] == "PUT":
+                pnl = entry - price
+
+            result = f"""
+✅ EXIT TRADE
+
+Option: {active_trade['option']}
+Entry: {entry:.2f}
+Exit: {price:.2f}
+PnL: {pnl:.2f}
+"""
+
+            trades.append(result)
+
+            send_telegram(result)
+            print(result)
+
+            active_trade = None
 
     time.sleep(60)
