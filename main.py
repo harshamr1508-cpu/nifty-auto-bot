@@ -10,47 +10,53 @@ CHAT_ID = "7608325440"
 
 # ========= SETTINGS =========
 MAX_TRADES = 10
-STOP_LOSS_PCT = 0.05
-TARGET_PCT = 0.10
+STOP_LOSS = 0.05
+TARGET = 0.10
 VOLUME_MULTIPLIER = 1.5
 
 trade_count = 0
 trades = []
 active_trade = None
+report_sent = False
 
 # ========= TELEGRAM FUNCTION =========
-
 def send_telegram(msg):
+
     try:
+
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-        data = {"chat_id": CHAT_ID, "text": msg}
+
+        data = {
+            "chat_id": CHAT_ID,
+            "text": msg
+        }
+
         requests.post(url, data=data)
+
     except:
         print("Telegram error")
 
 
-# ========= DATA DOWNLOAD =========
-
+# ========= DATA =========
 def get_data():
 
     try:
+
         df = yf.download("^NSEI", period="1d", interval="5m")
 
         if df is None or df.empty:
-            print("⚠ Data not received")
-            time.sleep(30)
+            print("No data received")
             return None
 
         return df
 
     except Exception as e:
+
         print("DATA ERROR:", e)
-        time.sleep(30)
         return None
 
 
 # ========= INDICATORS =========
-
 def add_indicators(df):
 
     df["EMA9"] = df["Close"].ewm(span=9).mean()
@@ -61,7 +67,6 @@ def add_indicators(df):
 
 
 # ========= ATM OPTION =========
-
 def get_atm(price):
 
     strike = round(price / 50) * 50
@@ -73,7 +78,6 @@ def get_atm(price):
 
 
 # ========= SIGNAL =========
-
 def check_signal(df):
 
     last = df.iloc[-1]
@@ -81,6 +85,7 @@ def check_signal(df):
     price = float(last["Close"])
     ema9 = float(last["EMA9"])
     ema21 = float(last["EMA21"])
+
     vol = float(last["Volume"])
     avg_vol = float(last["AVG_VOL"])
 
@@ -98,11 +103,9 @@ def check_signal(df):
     return None, price
 
 
-# ========= BOT START =========
+send_telegram("🚀 NIFTY AUTO BOT RUNNING IN CLOUD")
 
-send_telegram("🚀 NIFTY AUTO BOT V3 STARTED")
-
-print("BOT STARTED")
+print("BOT RUNNING")
 
 # ========= MAIN LOOP =========
 
@@ -110,52 +113,58 @@ while True:
 
     now = datetime.datetime.now().time()
 
-    if now < datetime.time(9,15):
+    market_start = datetime.time(9,15)
+    market_close = datetime.time(15,30)
+    report_time = datetime.time(15,35)
+
+    # -------- SLEEP TIME --------
+
+    if now < market_start or now > report_time:
+
+        print("Sleeping...")
+        report_sent = False
         time.sleep(60)
         continue
 
-    if now > datetime.time(15,30):
 
-        report = f"📊 DAY END REPORT\n\nTrades: {len(trades)}\n"
+    # -------- TRADING TIME --------
 
-        for t in trades:
-            report += f"{t}\n"
+    if market_start <= now <= market_close:
 
-        send_telegram(report)
+        df = get_data()
 
-        print("Market closed")
-        break
+        if df is None:
+            time.sleep(60)
+            continue
 
-    df = get_data()
+        df = add_indicators(df)
 
-    if df is None:
-        continue
+        signal, price = check_signal(df)
 
-    df = add_indicators(df)
+        # ENTRY
 
-    signal, price = check_signal(df)
+        if signal and trade_count < MAX_TRADES and active_trade is None:
 
-    # ===== ENTRY =====
+            trade_count += 1
 
-    if signal and trade_count < MAX_TRADES and active_trade is None:
+            call, put = get_atm(price)
 
-        trade_count += 1
+            option = call if signal == "CALL" else put
 
-        call, put = get_atm(price)
-        option = call if signal == "CALL" else put
+            sl = price * (1 - STOP_LOSS)
+            target = price * (1 + TARGET)
 
-        sl = price * (1 - STOP_LOSS_PCT)
-        target = price * (1 + TARGET_PCT)
+            active_trade = {
 
-        active_trade = {
-            "type": signal,
-            "entry": price,
-            "sl": sl,
-            "target": target,
-            "option": option
-        }
+                "type": signal,
+                "entry": price,
+                "sl": sl,
+                "target": target,
+                "option": option
 
-        msg = f"""
+            }
+
+            msg = f"""
 📢 ENTRY {signal}
 
 Option: {option}
@@ -166,26 +175,26 @@ Target: {target:.2f}
 Trade No: {trade_count}
 """
 
-        send_telegram(msg)
-        print(msg)
+            send_telegram(msg)
 
+            print(msg)
 
-    # ===== EXIT =====
+        # EXIT
 
-    if active_trade:
+        if active_trade:
 
-        entry = active_trade["entry"]
-        sl = active_trade["sl"]
-        target = active_trade["target"]
+            entry = active_trade["entry"]
+            sl = active_trade["sl"]
+            target = active_trade["target"]
 
-        if price <= sl or price >= target:
+            if price <= sl or price >= target:
 
-            pnl = price - entry
+                pnl = price - entry
 
-            if active_trade["type"] == "PUT":
-                pnl = entry - price
+                if active_trade["type"] == "PUT":
+                    pnl = entry - price
 
-            result = f"""
+                result = f"""
 ✅ EXIT TRADE
 
 Option: {active_trade['option']}
@@ -194,11 +203,32 @@ Exit: {price:.2f}
 PnL: {pnl:.2f}
 """
 
-            trades.append(result)
+                trades.append(result)
 
-            send_telegram(result)
-            print(result)
+                send_telegram(result)
 
-            active_trade = None
+                print(result)
 
-    time.sleep(60)
+                active_trade = None
+
+        time.sleep(300)
+
+        continue
+
+
+    # -------- REPORT TIME --------
+
+    if market_close < now <= report_time and not report_sent:
+
+        report = f"📊 DAY END REPORT\n\nTrades: {len(trades)}\n"
+
+        for t in trades:
+            report += f"{t}\n"
+
+        send_telegram(report)
+
+        print("Report sent")
+
+        report_sent = True
+
+        time.sleep(60)
